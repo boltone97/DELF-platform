@@ -12,28 +12,42 @@
 create extension if not exists pgcrypto with schema extensions;
 
 -- ---------- Tables ----------
+-- Compatible avec les tables existantes :
+--   students (name, pin, progress jsonb, created_at)
+--   writings (id, student_name, level, text, feedback, submitted_at)
+-- Elles ne sont créées que si elles n'existent pas encore ; le script ajoute
+-- seulement ce qui manque (colonnes anti force brute, index d'unicité).
 
 create table if not exists public.students (
-  name            text primary key check (char_length(name) between 1 and 40),
-  pin_hash        text not null,
-  progress        jsonb not null,
-  failed_attempts int not null default 0,
-  locked_until    timestamptz,
-  created_at      timestamptz not null default now()
+  name       text primary key,
+  pin        text not null,
+  progress   jsonb not null,
+  created_at timestamptz not null default now()
 );
 
 create table if not exists public.writings (
-  student_name text not null references public.students(name) on delete cascade on update cascade,
-  level        text not null check (level in ('A1', 'A2', 'B1', 'B2')),
+  id           bigint generated always as identity primary key,
+  student_name text not null,
+  level        text not null,
   text         text not null,
-  submitted_at timestamptz not null default now(),
-  feedback     text not null default '',
-  primary key (student_name, level)
+  feedback     text default '',
+  submitted_at timestamptz not null default now()
 );
+
+-- La colonne « pin » contient désormais un hachage bcrypt, jamais le code en clair.
+alter table public.students alter column pin type text using pin::text;
+alter table public.students add column if not exists failed_attempts int not null default 0;
+alter table public.students add column if not exists locked_until timestamptz;
+create unique index if not exists students_name_uniq on public.students (name);
+create index if not exists writings_student_level_idx on public.writings (student_name, level, submitted_at desc);
+
+-- Hache les éventuels codes encore stockés en clair (4 chiffres).
+update public.students set pin = extensions.crypt(pin, extensions.gen_salt('bf'))
+ where pin ~ '^[0-9]{4}$';
 
 create table if not exists public.sessions (
   token        uuid primary key default gen_random_uuid(),
-  student_name text references public.students(name) on delete cascade on update cascade,
+  student_name text,
   is_teacher   boolean not null default false,
   expires_at   timestamptz not null default now() + interval '30 days'
 );
@@ -68,7 +82,7 @@ $$;
 create or replace function public._writing_json(w public.writings) returns jsonb
 language sql stable as $$
   select case when w.student_name is null then null
-    else jsonb_build_object('text', w.text, 'submittedAt', w.submitted_at, 'feedback', w.feedback) end
+    else jsonb_build_object('text', w.text, 'submittedAt', w.submitted_at, 'feedback', coalesce(w.feedback, '')) end
 $$;
 
 create or replace function public._session_student(p_token uuid) returns text
@@ -94,8 +108,8 @@ begin
   if v_name = '' or char_length(v_name) > 40 or coalesce(p_pin, '') !~ '^[0-9]{4}$' then
     return jsonb_build_object('status', 'invalid');
   end if;
-  insert into public.students (name, pin_hash, progress)
-  values (v_name, crypt(p_pin, gen_salt('bf')), public._empty_progress())
+  insert into public.students (name, pin, progress, created_at)
+  values (v_name, crypt(p_pin, gen_salt('bf')), public._empty_progress(), now())
   on conflict (name) do nothing
   returning * into s;
   if not found then
@@ -119,7 +133,7 @@ begin
   if s.locked_until is not null and s.locked_until > now() then
     return jsonb_build_object('status', 'locked');
   end if;
-  if s.pin_hash <> crypt(coalesce(p_pin, ''), s.pin_hash) then
+  if s.pin <> crypt(coalesce(p_pin, ''), s.pin) then
     update public.students
        set failed_attempts = failed_attempts + 1,
            locked_until = case when failed_attempts + 1 >= 5 then now() + interval '15 minutes' end
@@ -174,7 +188,8 @@ declare
   w      public.writings;
 begin
   if v_name is null then return jsonb_build_object('status', 'unauthorized'); end if;
-  select * into w from public.writings where student_name = v_name and level = p_level;
+  select * into w from public.writings where student_name = v_name and level = p_level
+   order by submitted_at desc limit 1;
   return jsonb_build_object('status', 'ok', 'writing', public._writing_json(w));
 end $$;
 
@@ -190,11 +205,17 @@ begin
   if p_level not in ('A1', 'A2', 'B1', 'B2') or char_length(v_text) < 20 or char_length(v_text) > 20000 then
     return jsonb_build_object('status', 'invalid');
   end if;
-  insert into public.writings (student_name, level, text, submitted_at, feedback)
-  values (v_name, p_level, v_text, now(), '')
-  on conflict (student_name, level) do update
-    set text = excluded.text, submitted_at = excluded.submitted_at, feedback = ''
+  -- Une seule expression écrite par élève et par niveau : la nouvelle version
+  -- remplace l'ancienne (et efface l'ancienne correction).
+  update public.writings set text = v_text, submitted_at = now(), feedback = ''
+   where id = (select id from public.writings where student_name = v_name and level = p_level
+               order by submitted_at desc limit 1)
   returning * into w;
+  if not found then
+    insert into public.writings (student_name, level, text, submitted_at, feedback)
+    values (v_name, p_level, v_text, now(), '')
+    returning * into w;
+  end if;
   update public.students
      set progress = jsonb_set(progress, array[p_level],
            coalesce(progress -> p_level, '{}'::jsonb) || '{"writingSubmitted": true}'::jsonb)
@@ -235,7 +256,9 @@ language plpgsql stable security definer set search_path = public as $$
 begin
   if not public._session_is_teacher(p_token) then return jsonb_build_object('status', 'unauthorized'); end if;
   return jsonb_build_object('status', 'ok', 'writings', coalesce(
-    (select jsonb_object_agg(w.level, public._writing_json(w)) from public.writings w where w.student_name = p_name),
+    (select jsonb_object_agg(w.level, public._writing_json(w))
+       from (select distinct on (level) * from public.writings
+              where student_name = p_name order by level, submitted_at desc) w),
     '{}'::jsonb));
 end $$;
 
@@ -245,7 +268,8 @@ declare w public.writings;
 begin
   if not public._session_is_teacher(p_token) then return jsonb_build_object('status', 'unauthorized'); end if;
   update public.writings set feedback = btrim(coalesce(p_feedback, ''))
-   where student_name = p_name and level = p_level
+   where id = (select id from public.writings where student_name = p_name and level = p_level
+               order by submitted_at desc limit 1)
    returning * into w;
   if not found then return jsonb_build_object('status', 'not_found'); end if;
   return jsonb_build_object('status', 'ok', 'writing', public._writing_json(w));

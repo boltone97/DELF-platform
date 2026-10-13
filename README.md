@@ -25,6 +25,11 @@ npm run build    # build de production dans dist/
 
 1. Créez un compte et un projet sur <https://supabase.com> (offre gratuite suffisante).
 2. Dans **SQL Editor → New query**, collez le contenu de [`supabase/schema.sql`](supabase/schema.sql) et cliquez **Run**.
+   Le script réutilise vos tables `students (name, pin, progress, created_at)` et
+   `writings (id, student_name, level, text, feedback, submitted_at)` si elles existent déjà :
+   il y ajoute seulement deux colonnes anti force brute (`failed_attempts`, `locked_until`),
+   un index d'unicité sur `students.name`, et deux tables techniques (`sessions`, `app_config`).
+   Les codes PIN déjà présents en clair dans `students.pin` sont hachés (bcrypt).
 3. Toujours dans le SQL Editor, collez [`supabase/set_teacher_password.sql`](supabase/set_teacher_password.sql),
    remplacez `CHANGEZ-MOI` par le mot de passe formateur de votre choix, puis **Run**.
    (Ne commitez pas votre vrai mot de passe.)
